@@ -12,7 +12,7 @@ import trimesh
 import torch
 from torch.utils.data import DataLoader
 
-from .utils import get_rays
+from .utils import get_rays, get_rays_dir
 
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
@@ -299,13 +299,16 @@ class NeRFDataset:
 
         error_map = None if self.error_map is None else self.error_map[index]
         
-        rays = get_rays(poses, self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
+        rays = get_rays_dir(poses.device, poses.shape[0], self.intrinsics, self.H, self.W, self.num_rays, error_map, self.opt.patch_size)
 
         results = {
             'H': self.H,
             'W': self.W,
-            'rays_o': rays['rays_o'],
-            'rays_d': rays['rays_d'],
+            # 'rays_o': rays['rays_o'],
+            # 'rays_d': rays['rays_d'],
+            'poses': poses, 
+            'directions': rays['directions'], 
+            'index': index, 
         }
 
         if self.images is not None:

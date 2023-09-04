@@ -138,7 +138,18 @@ class NeRFRenderer(nn.Module):
         aabb = self.aabb_train if self.training else self.aabb_infer
 
         # sample steps
-        nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
+        # nears_min = torch.tensor(self.min_near, dtype=torch.float32, device=device).repeat(N)
+        nears_min = torch.full((N,), self.min_near, dtype=rays_o.dtype, device=device)
+        # fars = torch.tensor(self.bound * 2 * 1.732, dtype=torch.float32, device=device).repeat(N)
+        t1 = (aabb[:3] - rays_o) / rays_d
+        t2 = (aabb[3:] - rays_o) / rays_d
+        _t1, _t2 = torch.min(t1, t2), torch.max(t1, t2)
+        nears, fars = torch.max(_t1, dim=1)[0], torch.min(_t2, dim=1)[0]
+        idx = torch.where(nears > fars)
+        nears[idx], fars[idx] = torch.finfo(rays_o.dtype).max, torch.finfo(rays_o.dtype).max
+        nears = torch.max(nears_min, nears)
+        
+        # nears, fars = raymarching.near_far_from_aabb(rays_o, rays_d, aabb, self.min_near)
         nears.unsqueeze_(-1)
         fars.unsqueeze_(-1)
 

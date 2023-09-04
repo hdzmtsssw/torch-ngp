@@ -1,6 +1,9 @@
+import os
+# os.environ['CUDA_VISIBLE_DEVICES']='3'
 import torch
 import argparse
-
+from nerf.camera_optimizer import CameraOptimizer
+from nerf.deblur_optimizer import DeblurOptimizer
 from nerf.provider import NeRFDataset
 from nerf.gui import NeRFGUI
 from nerf.utils import *
@@ -10,11 +13,42 @@ from loss import huber_loss
 
 #torch.autograd.set_detect_anomaly(True)
 
+# # inverse
+def ngp_matrix_to_nerf(poses, scale=0.33, offset=[0, 0, 0]):
+    n = poses.shape[0]
+    new_poses = []
+    for i in range(n):
+        pose = poses[i]
+        new_pose = np.array([
+            [pose[2, 0], -pose[2, 1], -pose[2, 2], (pose[2, 3] - offset[2]) / scale],
+            [pose[0, 0], -pose[0, 1], -pose[0, 2], (pose[0, 3] - offset[0]) / scale],
+            [pose[1, 0], -pose[1, 1], -pose[1, 2], (pose[1, 3] - offset[1]) / scale],
+            [0, 0, 0, 1],
+        ], dtype=np.float32)
+        new_poses.append(new_pose)
+    new_poses = np.stack(new_poses, axis=0)
+    return new_pose
+# inverse
+# def ngp_matrix_to_nerf(poses, scale=0.33, offset=[0, 0, 0]):
+#     n = poses.shape[0]
+#     new_poses = []
+#     for i in range(n):
+#         pose = poses[i]
+#         new_pose = np.array([
+#             [pose[0, 0], pose[0, 1], pose[0, 2], pose[0, 3] / scale + offset[0]],
+#             [pose[1, 0], pose[1, 1], pose[1, 2], pose[1, 3] / scale + offset[1]],
+#             [pose[2, 0], pose[2, 1], pose[2, 2], pose[2, 3] / scale + offset[2]],
+#             [0, 0, 0, 1],
+#         ], dtype=np.float32)
+#         new_poses.append(new_pose)
+#     new_poses = np.stack(new_poses, axis=0)
+#     return new_poses
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str)
-    parser.add_argument('-O', action='store_true', help="equals --fp16 --cuda_ray --preload")
+    parser.add_argument('-O', action='store_true', default=False, help="equals --fp16 --cuda_ray --preload")
     parser.add_argument('--test', action='store_true', help="test mode")
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--seed', type=int, default=0)
@@ -33,13 +67,13 @@ if __name__ == '__main__':
     parser.add_argument('--patch_size', type=int, default=1, help="[experimental] render patches in training, so as to apply LPIPS loss. 1 means disabled, use [64, 32, 16] to enable")
 
     ### network backbone options
-    parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
+    parser.add_argument('--fp16', action='store_true', default=True, help="use amp mixed precision training")
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP")
-    parser.add_argument('--tcnn', action='store_true', help="use TCNN backend")
+    parser.add_argument('--tcnn', action='store_true', default=True, help="use TCNN backend")
 
     ### dataset options
     parser.add_argument('--color_space', type=str, default='srgb', help="Color space, supports (linear, srgb)")
-    parser.add_argument('--preload', action='store_true', help="preload all data into GPU, accelerate training but use more GPU memory")
+    parser.add_argument('--preload', action='store_true', default=True, help="preload all data into GPU, accelerate training but use more GPU memory")
     # (the default value is for the fox dataset)
     parser.add_argument('--bound', type=float, default=2, help="assume the scene is bounded in box[-bound, bound]^3, if > 1, will invoke adaptive ray marching.")
     parser.add_argument('--scale', type=float, default=0.33, help="scale camera location into box[-bound, bound]^3")
@@ -61,6 +95,19 @@ if __name__ == '__main__':
     parser.add_argument('--error_map', action='store_true', help="use error map to sample rays")
     parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
     parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
+
+    ### camera_pose
+    parser.add_argument('--optimize_ext', action='store_true', default=False,
+                        help='whether to optimize extrinsics')
+    parser.add_argument('--ext_lr', type=float, default=6e-4, help="initial learning rate")
+
+    ### badnerf_deblur
+    parser.add_argument('--deblur', action='store_true', default=False,
+                        help='whether to use badnerf')
+    parser.add_argument('--deblur_images', type=int, default=5,
+                        help='number of virtural cams')
+    parser.add_argument('--deblur_lr', type=float, default=5e-4,
+                        help='learning rate')
 
     opt = parser.parse_args()
 
@@ -128,16 +175,33 @@ if __name__ == '__main__':
             trainer.save_mesh(resolution=256, threshold=10)
     
     else:
+        train_dataset = NeRFDataset(opt, device=device, type='train')
+        train_loader = train_dataset.dataloader()
 
-        optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+        if opt.optimize_ext:
+            N = train_dataset.poses.shape[0]
+            camera_optimizer = CameraOptimizer(N)
+        else:
+            camera_optimizer = None
+        if opt.deblur:
+            deblur_optimizer = DeblurOptimizer(train_dataset.poses)
+        else:
+            deblur_optimizer = None
 
-        train_loader = NeRFDataset(opt, device=device, type='train').dataloader()
+        optimizer = lambda model, camera_optimizer, deblur_optimizer: \
+                        torch.optim.Adam(model.get_params(opt.lr) + \
+                                         ([camera_optimizer.get_params(opt.ext_lr)] if opt.optimize_ext else []) + \
+                                         ([deblur_optimizer.get_params(opt.deblur_lr)] if opt.deblur else []) \
+                                         , betas=(0.9, 0.99), eps=1e-15)
+        # optimizer = lambda model, camera_optimizer: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
+
 
         # decay to 0.1 * init_lr at last iter step
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, \
+                          lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50, camera_optimizer=camera_optimizer, deblur_optimizer=deblur_optimizer)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)
@@ -148,6 +212,20 @@ if __name__ == '__main__':
 
             max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
             trainer.train(train_loader, valid_loader, max_epoch)
+
+            poses_ori = ngp_matrix_to_nerf(train_dataset.poses[:, :3, :4].cpu().detach().numpy(), scale=opt.scale, offset=opt.offset)
+            print(poses_ori.shape)
+            np.save(os.path.join(opt.workspace, 'poses_ori.npy'), poses_ori)
+            if opt.optimize_ext:
+                bottom = train_dataset.poses[:, 3:, :4]
+                poses = train_dataset.poses[:, :3, :4]
+                emb = camera_optimizer(torch.arange(poses.shape[0]))
+                poses = multiply(poses, emb)
+                poses = torch.cat([poses, bottom], dim=1)
+                poses_np = poses.cpu().detach().numpy()
+                poses_np_inv = ngp_matrix_to_nerf(poses_np, scale=opt.scale, offset=opt.offset)
+                
+                np.save(os.path.join(opt.workspace, 'poses_optimized.npy'), poses_np_inv)
 
             # also test
             test_loader = NeRFDataset(opt, device=device, type='test').dataloader()

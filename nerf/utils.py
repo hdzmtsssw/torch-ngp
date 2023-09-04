@@ -32,6 +32,39 @@ from packaging import version as pver
 import lpips
 from torchmetrics.functional import structural_similarity_index_measure
 
+from nerf.spline import SplineN_linear
+# inverse
+def ngp_matrix_to_nerf(poses, scale=0.33, offset=[0, 0, 0]):
+    n = poses.shape[0]
+    new_poses = []
+    for i in range(n):
+        pose = poses[i]
+        new_pose = np.array([
+            [pose[2, 0], -pose[2, 1], -pose[2, 2], (pose[2, 3] - offset[2]) / scale],
+            [pose[0, 0], -pose[0, 1], -pose[0, 2], (pose[0, 3] - offset[0]) / scale],
+            [pose[1, 0], -pose[1, 1], -pose[1, 2], (pose[1, 3] - offset[1]) / scale],
+            [0, 0, 0, 1],
+        ], dtype=np.float32)
+        new_poses.append(new_pose)
+    new_poses = np.stack(new_poses, axis=0)
+    return new_pose
+
+# def ngp_matrix_to_nerf(poses, scale=0.33, offset=[0, 0, 0]):
+#     n = poses.shape[0]
+#     new_poses = []
+#     for i in range(n):
+#         pose = poses[i]
+#         new_pose = np.array([
+#             [pose[0, 0], pose[0, 1], pose[0, 2], pose[0, 3] / scale + offset[0]],
+#             [pose[1, 0], pose[1, 1], pose[1, 2], pose[1, 3] / scale + offset[1]],
+#             [pose[2, 0], pose[2, 1], pose[2, 2], pose[2, 3] / scale + offset[2]],
+#             [0, 0, 0, 1],
+#         ], dtype=np.float32)
+#         new_poses.append(new_pose)
+#     new_poses = np.stack(new_poses, axis=0)
+#     return new_poses
+
+
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
     if pver.parse(torch.__version__) < pver.parse('1.10'):
@@ -135,6 +168,128 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     results['rays_d'] = rays_d
 
     return results
+
+@torch.cuda.amp.autocast(enabled=False)
+def get_rays_dir(device, B, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
+    ''' get rays
+    Args:
+        poses: [B, 4, 4], cam2world
+        intrinsics: [4]
+        H, W, N: int
+        error_map: [B, 128 * 128], sample probability based on training error
+    Returns:
+        rays_o, rays_d: [B, N, 3]
+        inds: [B, N]
+    '''
+
+    # device = poses.device
+    # B = poses.shape[0]
+    fx, fy, cx, cy = intrinsics
+
+    i, j = custom_meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device)) # float
+    i = i.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+    j = j.t().reshape([1, H*W]).expand([B, H*W]) + 0.5
+
+    results = {}
+
+    if N > 0:
+        N = min(N, H*W)
+
+        # if use patch-based sampling, ignore error_map
+        if patch_size > 1:
+
+            # random sample left-top cores.
+            # NOTE: this impl will lead to less sampling on the image corner pixels... but I don't have other ideas.
+            num_patch = N // (patch_size ** 2)
+            inds_x = torch.randint(0, H - patch_size, size=[num_patch], device=device)
+            inds_y = torch.randint(0, W - patch_size, size=[num_patch], device=device)
+            inds = torch.stack([inds_x, inds_y], dim=-1) # [np, 2]
+
+            # create meshgrid for each patch
+            pi, pj = custom_meshgrid(torch.arange(patch_size, device=device), torch.arange(patch_size, device=device))
+            offsets = torch.stack([pi.reshape(-1), pj.reshape(-1)], dim=-1) # [p^2, 2]
+
+            inds = inds.unsqueeze(1) + offsets.unsqueeze(0) # [np, p^2, 2]
+            inds = inds.view(-1, 2) # [N, 2]
+            inds = inds[:, 0] * W + inds[:, 1] # [N], flatten
+
+            inds = inds.expand([B, N])
+
+        elif error_map is None:
+            inds = torch.randint(0, H*W, size=[N], device=device) # may duplicate
+            inds = inds.expand([B, N])
+        else:
+
+            # weighted sample on a low-reso grid
+            inds_coarse = torch.multinomial(error_map.to(device), N, replacement=False) # [B, N], but in [0, 128*128)
+
+            # map to the original resolution with random perturb.
+            inds_x, inds_y = inds_coarse // 128, inds_coarse % 128 # `//` will throw a warning in torch 1.10... anyway.
+            sx, sy = H / 128, W / 128
+            inds_x = (inds_x * sx + torch.rand(B, N, device=device) * sx).long().clamp(max=H - 1)
+            inds_y = (inds_y * sy + torch.rand(B, N, device=device) * sy).long().clamp(max=W - 1)
+            inds = inds_x * W + inds_y
+
+            results['inds_coarse'] = inds_coarse # need this when updating error_map
+
+        i = torch.gather(i, -1, inds)
+        j = torch.gather(j, -1, inds)
+
+        results['inds'] = inds
+
+    else:
+        inds = torch.arange(H*W, device=device).expand([B, H*W])
+
+    zs = torch.ones_like(i)
+    xs = (i - cx) / fx * zs
+    ys = (j - cy) / fy * zs
+    directions = torch.stack((xs, ys, zs), dim=-1)
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    results['directions'] = directions
+
+    return results
+
+@torch.cuda.amp.autocast(enabled=False)
+def get_rays_(poses, directions):
+    ''' get rays
+    Args:
+        poses: [B, 4, 4], cam2world
+        intrinsics: [4]
+        H, W, N: int
+        error_map: [B, 128 * 128], sample probability based on training error
+    Returns:
+        rays_o, rays_d: [B, N, 3]
+        inds: [B, N]
+    '''
+
+    results = {}
+
+    rays_d = directions @ poses[:, :3, :3].transpose(-1, -2) # (B, N, 3)
+
+    rays_o = poses[..., :3, 3] # [B, 3]
+    rays_o = rays_o[..., None, :].expand_as(rays_d) # [B, N, 3]
+
+    results['rays_o'] = rays_o
+    results['rays_d'] = rays_d
+
+    return results
+
+def multiply(pose_a, pose_b):
+    """Multiply two pose matrices, A @ B.
+
+    Args:
+        pose_a: Left pose matrix, usually a transformation applied to the right.
+        pose_b: Right pose matrix, usually a camera pose that will be transformed by pose_a.
+
+    Returns:
+        Camera pose matrix where pose_a was applied to pose_b.
+    """
+    R1, t1 = pose_a[..., :3, :3], pose_a[..., :3, 3:]
+    R2, t2 = pose_b[..., :3, :3], pose_b[..., :3, 3:]
+    R = R1.matmul(R2)
+    t = t1 + R1.matmul(t2)
+    return torch.cat([R, t], dim=-1)
+
 
 
 def seed_everything(seed):
@@ -337,6 +492,8 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 camera_optimizer=None, 
+                 deblur_optimizer=None
                  ):
         
         self.name = name
@@ -359,13 +516,25 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
+        
 
         model.to(self.device)
+        if opt.optimize_ext:
+            camera_optimizer.to(self.device)
+        if opt.deblur:
+            deblur_optimizer.to(self.device)
         if self.world_size > 1:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+            if opt.optimize_ext:
+                camera_optimizer = torch.nn.SyncBatchNorm.convert_sync_batchnorm(camera_optimizer)
+                camera_optimizer = torch.nn.parallel.DistributedDataParallel(camera_optimizer, device_ids=[local_rank])
+            if opt.deblur:
+                deblur_optimizer = torch.nn.SyncBatchNorm.convert_sync_batchnorm(deblur_optimizer)
+                deblur_optimizer = torch.nn.parallel.DistributedDataParallel(deblur_optimizer, device_ids=[local_rank])
         self.model = model
-
+        self.camera_optimizer = camera_optimizer
+        self.deblur_optimizer = deblur_optimizer
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
         self.criterion = criterion
@@ -378,8 +547,7 @@ class Trainer(object):
         if optimizer is None:
             self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-4) # naive adam
         else:
-            self.optimizer = optimizer(self.model)
-
+            self.optimizer = optimizer(self.model, self.camera_optimizer, self.deblur_optimizer)
         if lr_scheduler is None:
             self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda epoch: 1) # fake scheduler
         else:
@@ -466,9 +634,42 @@ class Trainer(object):
     ### ------------------------------	
 
     def train_step(self, data):
+        poses = data['poses'] # (b, 4, 4)
+        directions = data['directions'] # (b, N, 3)
+        if self.opt.optimize_ext:
+            bottom = poses[:, 3:, :4]
+            poses = poses[:, :3, :4]
+            index = data['index']
+            emb = self.camera_optimizer(index)
+            poses = multiply(poses, emb)
+            poses = torch.cat([poses, bottom], dim=1)
+        if self.opt.deblur:
+            B = poses.shape[0]
+            bottom = poses[:, 3:, :4]
+            index = data['index']
+            deblur_images_num = self.opt.deblur_images
+            # if self.opt.deblur_images % 2 == 0:
+            #     deblur_images_num += 1
+            se3_start = self.deblur_optimizer(index)[:, :6]
+            se3_end = self.deblur_optimizer(index)[:, 6:]
+            pose_nums = torch.arange(deblur_images_num).reshape(1, -1).repeat(se3_start.shape[0], 1)
+            pose_nums = pose_nums.to(self.device)
+            seg_pos_x = torch.arange(se3_start.shape[0]).reshape([se3_start.shape[0], 1]).repeat(1, deblur_images_num)
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
+            se3_start = se3_start[seg_pos_x, :]
+            se3_end = se3_end[seg_pos_x, :]
+
+            poses = SplineN_linear(se3_start, se3_end, pose_nums, deblur_images_num).reshape(-1, 3, 4) # (bs, deblur_images, 3, 4)
+            bottom = torch.tile(bottom.unsqueeze(1), [1, deblur_images_num, 1, 1]).reshape(-1, 1, 4)
+            poses = torch.cat([poses, bottom], dim=1)
+            directions = directions.unsqueeze(1).repeat(1, deblur_images_num, 1, 1).reshape(B*deblur_images_num, -1, 3) # (bs, deblur_images, N, 3)
+
+        rays = get_rays_(poses, directions)
+
+        rays_o = rays['rays_o'] # [B, N, 3]
+        rays_d = rays['rays_d'] # [B, N, 3]
+        # rays_o = data['rays_o'] # [B, N, 3]
+        # rays_d = data['rays_d'] # [B, N, 3]
 
         # if there is no gt image, we train with CLIP loss.
         if 'images' not in data:
@@ -510,6 +711,8 @@ class Trainer(object):
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
         # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
     
+        if self.opt.deblur:
+            outputs['image'] = torch.mean(outputs['image'].reshape(B, deblur_images_num, N, 3), axis=1) # [B, deblur_images, N, 3] --> [B, N, 3]
         pred_rgb = outputs['image']
 
         # MSE loss
@@ -564,9 +767,12 @@ class Trainer(object):
         return pred_rgb, gt_rgb, loss
 
     def eval_step(self, data):
+        poses = data['poses']
+        directions = data['directions']
+        rays = get_rays_(poses, directions)
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
+        rays_o = rays['rays_o'] # [B, N, 3]
+        rays_d = rays['rays_d'] # [B, N, 3]
         images = data['images'] # [B, H, W, 3/4]
         B, H, W, C = images.shape
 
@@ -591,9 +797,12 @@ class Trainer(object):
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
+        poses = data['poses']
+        directions = data['directions']
+        rays = get_rays_(poses, directions)
 
-        rays_o = data['rays_o'] # [B, N, 3]
-        rays_d = data['rays_d'] # [B, N, 3]
+        rays_o = rays['rays_o'] # [B, N, 3]
+        rays_d = rays['rays_d'] # [B, N, 3]
         H, W = data['H'], data['W']
 
         if bg_color is not None:
@@ -653,6 +862,30 @@ class Trainer(object):
             if self.epoch % self.eval_interval == 0:
                 self.evaluate_one_epoch(valid_loader)
                 self.save_checkpoint(full=False, best=True)
+
+        # save pose
+        if self.opt.deblur and self.local_rank == 0:
+            with torch.no_grad():
+                deblur_images_num = self.opt.deblur_images
+                if self.opt.deblur_images % 2 == 0:
+                    deblur_images_num += 1
+                se3_start = self.deblur_optimizer.se3[:, :6]
+                se3_end = self.deblur_optimizer.se3[:, 6:]
+                pose_nums = torch.arange(deblur_images_num).reshape(1, -1).repeat(se3_start.shape[0], 1)
+                pose_nums = pose_nums.to(self.device)
+                seg_pos_x = torch.arange(se3_start.shape[0]).reshape([se3_start.shape[0], 1]).repeat(1, deblur_images_num)
+
+                se3_start = se3_start[seg_pos_x, :]
+                se3_end = se3_end[seg_pos_x, :]
+
+                all_poses = SplineN_linear(se3_start, se3_end, pose_nums, deblur_images_num).reshape(-1, 3, 4) # (bs, deblur_images, 3, 4)
+                i_render_pose = torch.arange(self.deblur_optimizer.se3.shape[0]) * self.opt.deblur_images + self.opt.deblur_images // 2
+                poses = all_poses[i_render_pose]
+
+                poses_np = poses.cpu().detach().numpy()
+                poses_np_inv = ngp_matrix_to_nerf(poses_np, scale=self.opt.scale, offset=self.opt.offset)
+
+                np.save(os.path.join(self.opt.workspace, 'poses_deblur.npy'), poses_np_inv)
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
@@ -1037,6 +1270,10 @@ class Trainer(object):
         if not best:
 
             state['model'] = self.model.state_dict()
+            if self.opt.optimize_ext:
+                state['camera_optimizer'] = self.camera_optimizer.state_dict()
+            if self.opt.deblur:
+                state['deblur_optimizer'] = self.deblur_optimizer.state_dict()
 
             file_path = f"{self.ckpt_path}/{name}.pth"
 
@@ -1062,6 +1299,10 @@ class Trainer(object):
                         self.ema.copy_to()
 
                     state['model'] = self.model.state_dict()
+                    if self.opt.optimize_ext:
+                        state['camera_optimizer'] = self.camera_optimizer.state_dict()
+                    if self.opt.deblur:
+                        state['deblur_optimizer'] = self.deblur_optimizer.state_dict()
 
                     # we don't consider continued training from the best ckpt, so we discard the unneeded density_grid to save some storage (especially important for dnerf)
                     if 'density_grid' in state['model']:
@@ -1092,6 +1333,11 @@ class Trainer(object):
             return
 
         missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint_dict['model'], strict=False)
+        if self.opt.optimize_ext:
+            missing_keys_camera_optimizer, unexpected_keys_camera_optimizer = self.camera_optimizer.load_state_dict(checkpoint_dict['camera_optimizer'], strict=False)
+        if self.opt.deblur:
+            missing_keys_deblur_optimizer, unexpected_keys_deblur_optimizer = self.deblur_optimizer.load_state_dict(checkpoint_dict['deblur_optimizer'], strict=False)
+
         self.log("[INFO] loaded model.")
         if len(missing_keys) > 0:
             self.log(f"[WARN] missing keys: {missing_keys}")
